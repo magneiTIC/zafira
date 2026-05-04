@@ -81,6 +81,7 @@ export interface SupplierOrder {
   date: string;
   status: OrderStatus;
   items: SupplierOrderItem[];
+  deliveryFee: number;
   totalAmount: number;
   amountPaid: number;
   balanceDue: number;
@@ -162,6 +163,7 @@ export interface CreateSupplierOrderDto {
   date?: string;
   status?: OrderStatus;
   amountPaid?: number;
+  deliveryFee?: number;
   items: Array<{
     productId: string;
     quantity: number;

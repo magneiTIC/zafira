@@ -16,20 +16,21 @@ import {
   Supplier,
   SupplierOrder,
 } from './models';
-import { StoreService } from './store.service';
+import { PrismaService } from './prisma.service';
 
 const roundMoney = (value: number) => Math.round((Number(value) || 0) * 100) / 100;
 const toNumber = (value: unknown, fallback = 0) => roundMoney(Number(value ?? fallback));
 const today = () => new Date().toISOString().slice(0, 10);
-const stamp = () => new Date().toISOString();
-const id = (prefix: string) => `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+const toIso = (value: Date | string) => (value instanceof Date ? value.toISOString() : value);
+const toDateInput = (value?: string) => new Date(`${value || today()}T00:00:00.000Z`);
+const toDayString = (value: Date | string) => toIso(value).slice(0, 10);
 
 @Injectable()
 export class BusinessService {
-  constructor(private readonly store: StoreService) {}
+  constructor(private readonly prisma: PrismaService) {}
 
-  getAll() {
-    const database = this.store.read();
+  async getAll() {
+    const database = await this.readDatabase();
     return {
       products: database.products,
       customers: this.withCustomerDebt(database),
@@ -42,125 +43,165 @@ export class BusinessService {
     };
   }
 
-  getProducts() {
-    return this.store.read().products;
+  async getProducts() {
+    const products = await this.prisma.product.findMany({ orderBy: { name: 'asc' } });
+    return products.map((product) => this.mapProduct(product));
   }
 
-  createProduct(dto: CreateProductDto) {
+  async createProduct(dto: CreateProductDto) {
     this.requireText(dto.name, 'Le nom du produit est obligatoire.');
-    const now = stamp();
-    const product: Product = {
-      id: id('prod'),
-      name: dto.name.trim(),
-      sku: dto.sku?.trim() || '',
-      category: dto.category?.trim() || 'General',
-      unit: dto.unit?.trim() || 'piece',
-      stockQuantity: toNumber(dto.stockQuantity),
-      lowStockThreshold: toNumber(dto.lowStockThreshold, 5),
-      defaultPurchasePrice: toNumber(dto.defaultPurchasePrice),
-      defaultSalePrice: toNumber(dto.defaultSalePrice),
-      createdAt: now,
-      updatedAt: now,
-    };
+    const stockQuantity = toNumber(dto.stockQuantity);
 
-    this.store.update((database) => {
-      database.products.push(product);
-      if (product.stockQuantity !== 0) {
-        database.stockMovements.push(this.stockMovement(product, 'adjustment', product.stockQuantity, product.defaultPurchasePrice, 'Stock initial'));
+    const product = await this.prisma.$transaction(async (tx) => {
+      const created = await tx.product.create({
+        data: {
+          name: dto.name.trim(),
+          sku: dto.sku?.trim() || '',
+          category: dto.category?.trim() || 'General',
+          unit: dto.unit?.trim() || 'piece',
+          stockQuantity,
+          lowStockThreshold: toNumber(dto.lowStockThreshold, 2),
+          defaultPurchasePrice: toNumber(dto.defaultPurchasePrice),
+          defaultSalePrice: toNumber(dto.defaultSalePrice),
+        },
+      });
+
+      if (stockQuantity !== 0) {
+        await tx.stockMovement.create({
+          data: this.stockMovementData(created, 'adjustment', stockQuantity, created.defaultPurchasePrice, 'Stock initial'),
+        });
       }
+
+      return created;
     });
 
-    return product;
+    return this.mapProduct(product);
   }
 
-  updateProduct(productId: string, dto: Partial<CreateProductDto>) {
-    let updated: Product | undefined;
-    this.store.update((database) => {
-      const product = this.findProduct(database, productId);
-      const previousStock = product.stockQuantity;
-      product.name = dto.name?.trim() || product.name;
-      product.sku = dto.sku?.trim() ?? product.sku;
-      product.category = dto.category?.trim() || product.category;
-      product.unit = dto.unit?.trim() || product.unit;
-      product.lowStockThreshold = dto.lowStockThreshold === undefined ? product.lowStockThreshold : toNumber(dto.lowStockThreshold);
-      product.defaultPurchasePrice = dto.defaultPurchasePrice === undefined ? product.defaultPurchasePrice : toNumber(dto.defaultPurchasePrice);
-      product.defaultSalePrice = dto.defaultSalePrice === undefined ? product.defaultSalePrice : toNumber(dto.defaultSalePrice);
-      if (dto.stockQuantity !== undefined) {
-        product.stockQuantity = toNumber(dto.stockQuantity);
-        const change = roundMoney(product.stockQuantity - previousStock);
-        if (change !== 0) {
-          database.stockMovements.push(this.stockMovement(product, 'adjustment', change, product.defaultPurchasePrice, 'Correction de stock'));
-        }
+  async updateProduct(productId: string, dto: Partial<CreateProductDto>) {
+    const product = await this.prisma.$transaction(async (tx) => {
+      const current = await tx.product.findUnique({ where: { id: productId } });
+      if (!current) {
+        throw new NotFoundException('Produit introuvable.');
       }
-      product.updatedAt = stamp();
-      updated = product;
+
+      const nextStock = dto.stockQuantity === undefined ? current.stockQuantity : toNumber(dto.stockQuantity);
+      const updated = await tx.product.update({
+        where: { id: productId },
+        data: {
+          name: dto.name?.trim() || current.name,
+          sku: dto.sku?.trim() ?? current.sku,
+          category: dto.category?.trim() || current.category,
+          unit: dto.unit?.trim() || current.unit,
+          stockQuantity: nextStock,
+          lowStockThreshold: dto.lowStockThreshold === undefined ? current.lowStockThreshold : toNumber(dto.lowStockThreshold),
+          defaultPurchasePrice: dto.defaultPurchasePrice === undefined ? current.defaultPurchasePrice : toNumber(dto.defaultPurchasePrice),
+          defaultSalePrice: dto.defaultSalePrice === undefined ? current.defaultSalePrice : toNumber(dto.defaultSalePrice),
+        },
+      });
+
+      const change = roundMoney(updated.stockQuantity - current.stockQuantity);
+      if (change !== 0) {
+        await tx.stockMovement.create({
+          data: this.stockMovementData(updated, 'adjustment', change, updated.defaultPurchasePrice, 'Correction de stock'),
+        });
+      }
+
+      return updated;
     });
-    return updated;
+
+    return this.mapProduct(product);
   }
 
-  adjustStock(productId: string, dto: AdjustStockDto) {
-    let updated: Product | undefined;
-    this.store.update((database) => {
-      const product = this.findProduct(database, productId);
-      const quantityChange = toNumber(dto.quantityChange);
-      product.stockQuantity = roundMoney(product.stockQuantity + quantityChange);
-      product.updatedAt = stamp();
-      database.stockMovements.push(
-        this.stockMovement(product, 'adjustment', quantityChange, toNumber(dto.unitCost, product.defaultPurchasePrice), dto.note || 'Ajustement manuel'),
-      );
-      updated = product;
+  async adjustStock(productId: string, dto: AdjustStockDto) {
+    const quantityChange = toNumber(dto.quantityChange);
+    const product = await this.prisma.$transaction(async (tx) => {
+      const current = await tx.product.findUnique({ where: { id: productId } });
+      if (!current) {
+        throw new NotFoundException('Produit introuvable.');
+      }
+
+      const updated = await tx.product.update({
+        where: { id: productId },
+        data: { stockQuantity: roundMoney(current.stockQuantity + quantityChange) },
+      });
+
+      await tx.stockMovement.create({
+        data: this.stockMovementData(
+          updated,
+          'adjustment',
+          quantityChange,
+          toNumber(dto.unitCost, updated.defaultPurchasePrice),
+          dto.note || 'Ajustement manuel',
+        ),
+      });
+
+      return updated;
     });
-    return updated;
+
+    return this.mapProduct(product);
   }
 
-  getCustomers() {
-    return this.withCustomerDebt(this.store.read());
+  async getCustomers() {
+    const database = await this.readDatabase();
+    return this.withCustomerDebt(database);
   }
 
-  createCustomer(dto: CreateCustomerDto) {
+  async createCustomer(dto: CreateCustomerDto) {
     this.requireText(dto.name, 'Le nom du client est obligatoire.');
-    const customer: Customer = {
-      id: id('cust'),
-      name: dto.name.trim(),
-      phone: dto.phone?.trim() || '',
-      email: dto.email?.trim() || '',
-      createdAt: stamp(),
-    };
-    this.store.update((database) => database.customers.push(customer));
-    return customer;
+    const customer = await this.prisma.customer.create({
+      data: {
+        name: dto.name.trim(),
+        phone: dto.phone?.trim() || '',
+        email: dto.email?.trim() || '',
+      },
+    });
+    return this.mapCustomer(customer);
   }
 
-  getSuppliers() {
-    return this.store.read().suppliers;
+  async getSuppliers() {
+    const suppliers = await this.prisma.supplier.findMany({ orderBy: { name: 'asc' } });
+    return suppliers.map((supplier) => this.mapSupplier(supplier));
   }
 
-  createSupplier(dto: CreateSupplierDto) {
+  async createSupplier(dto: CreateSupplierDto) {
     this.requireText(dto.name, 'Le nom du fournisseur est obligatoire.');
-    const supplier: Supplier = {
-      id: id('sup'),
-      name: dto.name.trim(),
-      phone: dto.phone?.trim() || '',
-      email: dto.email?.trim() || '',
-      createdAt: stamp(),
-    };
-    this.store.update((database) => database.suppliers.push(supplier));
-    return supplier;
+    const supplier = await this.prisma.supplier.create({
+      data: {
+        name: dto.name.trim(),
+        phone: dto.phone?.trim() || '',
+        email: dto.email?.trim() || '',
+      },
+    });
+    return this.mapSupplier(supplier);
   }
 
-  getSales() {
-    return this.store.read().sales;
+  async getSales() {
+    const sales = await this.prisma.sale.findMany({
+      include: { items: true },
+      orderBy: [{ date: 'desc' }, { createdAt: 'desc' }],
+    });
+    return sales.map((sale) => this.mapSale(sale));
   }
 
-  createSale(dto: CreateSaleDto) {
+  async createSale(dto: CreateSaleDto) {
     if (!dto.items?.length) {
       throw new BadRequestException('La vente doit contenir au moins un produit.');
     }
 
-    let sale: Sale | undefined;
-    this.store.update((database) => {
-      const customer = this.findCustomer(database, dto.customerId);
-      const saleItems = dto.items.map((item) => {
-        const product = this.findProduct(database, item.productId);
+    const sale = await this.prisma.$transaction(async (tx) => {
+      const customer = await tx.customer.findUnique({ where: { id: dto.customerId } });
+      if (!customer) {
+        throw new NotFoundException('Client introuvable.');
+      }
+
+      const saleItems = [];
+      for (const item of dto.items) {
+        const product = await tx.product.findUnique({ where: { id: item.productId } });
+        if (!product) {
+          throw new NotFoundException('Produit introuvable.');
+        }
+
         const quantity = toNumber(item.quantity);
         if (quantity <= 0) {
           throw new BadRequestException(`La quantite de ${product.name} doit etre positive.`);
@@ -168,6 +209,7 @@ export class BusinessService {
         if (product.stockQuantity < quantity) {
           throw new BadRequestException(`Stock insuffisant pour ${product.name}. Disponible: ${product.stockQuantity}.`);
         }
+
         const unitPrice = toNumber(item.unitPrice, product.defaultSalePrice);
         const discountType: DiscountType = item.discountType || 'amount';
         const discountValue = toNumber(item.discountValue);
@@ -175,13 +217,13 @@ export class BusinessService {
         const discountAmount = this.calculateDiscount(lineSubtotal, discountType, discountValue);
         const lineTotal = roundMoney(Math.max(0, lineSubtotal - discountAmount));
         const lineCost = roundMoney(quantity * product.defaultPurchasePrice);
-        const lineProfit = roundMoney(lineTotal - lineCost);
 
-        product.stockQuantity = roundMoney(product.stockQuantity - quantity);
-        product.updatedAt = stamp();
+        await tx.product.update({
+          where: { id: product.id },
+          data: { stockQuantity: roundMoney(product.stockQuantity - quantity) },
+        });
 
-        return {
-          id: id('sale-item'),
+        saleItems.push({
           productId: product.id,
           productName: product.name,
           quantity,
@@ -193,170 +235,239 @@ export class BusinessService {
           discountAmount,
           lineTotal,
           lineCost,
-          lineProfit,
-        };
-      });
+          lineProfit: roundMoney(lineTotal - lineCost),
+        });
+      }
 
       const subtotal = roundMoney(saleItems.reduce((sum, item) => sum + item.lineSubtotal, 0));
       const discountTotal = roundMoney(saleItems.reduce((sum, item) => sum + item.discountAmount, 0));
       const totalAmount = roundMoney(saleItems.reduce((sum, item) => sum + item.lineTotal, 0));
       const costTotal = roundMoney(saleItems.reduce((sum, item) => sum + item.lineCost, 0));
       const amountReceived = Math.min(toNumber(dto.amountReceived), totalAmount);
-      const createdAt = stamp();
-      sale = {
-        id: id('sale'),
-        customerId: customer.id,
-        customerName: customer.name,
-        date: dto.date || today(),
-        items: saleItems,
-        subtotal,
-        discountTotal,
-        totalAmount,
-        costTotal,
-        amountReceived,
-        balanceDue: roundMoney(totalAmount - amountReceived),
-        profit: roundMoney(totalAmount - costTotal),
-        createdAt,
-        updatedAt: createdAt,
-      };
 
-      database.sales.unshift(sale);
-      if (amountReceived > 0) {
-        database.payments.unshift({
-          id: id('pay'),
-          saleId: sale.id,
+      const created = await tx.sale.create({
+        data: {
           customerId: customer.id,
           customerName: customer.name,
-          date: sale.date,
-          amount: amountReceived,
-          note: 'Avance ou paiement initial',
-          createdAt,
+          date: toDateInput(dto.date),
+          subtotal,
+          discountTotal,
+          totalAmount,
+          costTotal,
+          amountReceived,
+          balanceDue: roundMoney(totalAmount - amountReceived),
+          profit: roundMoney(totalAmount - costTotal),
+          items: { create: saleItems },
+        },
+        include: { items: true },
+      });
+
+      if (amountReceived > 0) {
+        await tx.payment.create({
+          data: {
+            saleId: created.id,
+            customerId: customer.id,
+            customerName: customer.name,
+            date: created.date,
+            amount: amountReceived,
+            note: 'Avance ou paiement initial',
+          },
         });
       }
-      saleItems.forEach((item) => {
-        database.stockMovements.push({
-          id: id('move'),
+
+      await tx.stockMovement.createMany({
+        data: saleItems.map((item) => ({
           productId: item.productId,
           productName: item.productName,
           type: 'sale',
           quantityChange: -item.quantity,
           unitCost: item.unitCostSnapshot,
-          reference: `Vente ${sale?.id}`,
-          date: sale?.date || today(),
-          createdAt,
-        });
+          reference: `Vente ${created.id}`,
+          date: created.date,
+        })),
       });
+
+      return created;
     });
 
-    return sale;
+    return this.mapSale(sale);
   }
 
-  addPayment(saleId: string, dto: CreatePaymentDto) {
+  async addPayment(saleId: string, dto: CreatePaymentDto) {
     const amount = toNumber(dto.amount);
     if (amount <= 0) {
       throw new BadRequestException('Le montant du paiement doit etre positif.');
     }
 
-    let sale: Sale | undefined;
-    this.store.update((database) => {
-      sale = this.findSale(database, saleId);
-      const acceptedAmount = Math.min(amount, sale.balanceDue);
+    const sale = await this.prisma.$transaction(async (tx) => {
+      const current = await tx.sale.findUnique({ where: { id: saleId } });
+      if (!current) {
+        throw new NotFoundException('Vente introuvable.');
+      }
+
+      const acceptedAmount = Math.min(amount, current.balanceDue);
       if (acceptedAmount <= 0) {
         throw new BadRequestException('Cette vente est deja soldee.');
       }
-      sale.amountReceived = roundMoney(sale.amountReceived + acceptedAmount);
-      sale.balanceDue = roundMoney(sale.totalAmount - sale.amountReceived);
-      sale.updatedAt = stamp();
-      database.payments.unshift({
-        id: id('pay'),
-        saleId: sale.id,
-        customerId: sale.customerId,
-        customerName: sale.customerName,
-        date: dto.date || today(),
-        amount: acceptedAmount,
-        note: dto.note?.trim() || 'Reglement client',
-        createdAt: stamp(),
+
+      const updated = await tx.sale.update({
+        where: { id: saleId },
+        data: {
+          amountReceived: roundMoney(current.amountReceived + acceptedAmount),
+          balanceDue: roundMoney(current.totalAmount - current.amountReceived - acceptedAmount),
+        },
+        include: { items: true },
       });
+
+      await tx.payment.create({
+        data: {
+          saleId: updated.id,
+          customerId: updated.customerId,
+          customerName: updated.customerName,
+          date: toDateInput(dto.date),
+          amount: acceptedAmount,
+          note: dto.note?.trim() || 'Reglement client',
+        },
+      });
+
+      return updated;
     });
-    return sale;
+
+    return this.mapSale(sale);
   }
 
-  getSupplierOrders() {
-    return this.store.read().supplierOrders;
+  async getSupplierOrders() {
+    const orders = await this.prisma.supplierOrder.findMany({
+      include: { items: true },
+      orderBy: [{ date: 'desc' }, { createdAt: 'desc' }],
+    });
+    return orders.map((order) => this.mapSupplierOrder(order));
   }
 
-  createSupplierOrder(dto: CreateSupplierOrderDto) {
+  async createSupplierOrder(dto: CreateSupplierOrderDto) {
     if (!dto.items?.length) {
       throw new BadRequestException('La commande fournisseur doit contenir au moins un produit.');
     }
 
-    let order: SupplierOrder | undefined;
-    this.store.update((database) => {
-      const supplier = this.findSupplier(database, dto.supplierId);
-      const createdAt = stamp();
-      const orderItems = dto.items.map((item) => {
-        const product = this.findProduct(database, item.productId);
+    const order = await this.prisma.$transaction(async (tx) => {
+      const supplier = await tx.supplier.findUnique({ where: { id: dto.supplierId } });
+      if (!supplier) {
+        throw new NotFoundException('Fournisseur introuvable.');
+      }
+
+      const orderItems = [];
+      for (const item of dto.items) {
+        const product = await tx.product.findUnique({ where: { id: item.productId } });
+        if (!product) {
+          throw new NotFoundException('Produit introuvable.');
+        }
+
         const quantity = toNumber(item.quantity);
         if (quantity <= 0) {
           throw new BadRequestException(`La quantite de ${product.name} doit etre positive.`);
         }
+
         const unitCost = toNumber(item.unitCost, product.defaultPurchasePrice);
-        return {
-          id: id('supplier-item'),
+        orderItems.push({
           productId: product.id,
           productName: product.name,
           quantity,
           unitCost,
           lineTotal: roundMoney(quantity * unitCost),
-        };
-      });
-      const totalAmount = roundMoney(orderItems.reduce((sum, item) => sum + item.lineTotal, 0));
-      const amountPaid = Math.min(toNumber(dto.amountPaid), totalAmount);
-      order = {
-        id: id('order'),
-        supplierId: supplier.id,
-        supplierName: supplier.name,
-        date: dto.date || today(),
-        status: dto.status || 'received',
-        items: orderItems,
-        totalAmount,
-        amountPaid,
-        balanceDue: roundMoney(totalAmount - amountPaid),
-        createdAt,
-        updatedAt: createdAt,
-      };
-
-      database.supplierOrders.unshift(order);
-      if (order.status === 'received') {
-        this.receiveSupplierOrder(database, order);
+        });
       }
-    });
 
-    return order;
-  }
+      const deliveryFee = toNumber(dto.deliveryFee);
+      if (deliveryFee < 0) {
+        throw new BadRequestException('Le montant de livraison ne peut pas etre negatif.');
+      }
 
-  getSummary() {
-    return this.buildSummary(this.store.read());
-  }
-
-  private receiveSupplierOrder(database: Database, order: SupplierOrder) {
-    order.items.forEach((item) => {
-      const product = this.findProduct(database, item.productId);
-      product.stockQuantity = roundMoney(product.stockQuantity + item.quantity);
-      product.defaultPurchasePrice = item.unitCost;
-      product.updatedAt = stamp();
-      database.stockMovements.push({
-        id: id('move'),
-        productId: product.id,
-        productName: product.name,
-        type: 'purchase',
-        quantityChange: item.quantity,
-        unitCost: item.unitCost,
-        reference: `Commande fournisseur ${order.id}`,
-        date: order.date,
-        createdAt: stamp(),
+      const productsTotal = roundMoney(orderItems.reduce((sum, item) => sum + item.lineTotal, 0));
+      const totalAmount = roundMoney(productsTotal + deliveryFee);
+      const amountPaid = Math.min(toNumber(dto.amountPaid), totalAmount);
+      const status = dto.status || 'received';
+      const created = await tx.supplierOrder.create({
+        data: {
+          supplierId: supplier.id,
+          supplierName: supplier.name,
+          date: toDateInput(dto.date),
+          status,
+          deliveryFee,
+          totalAmount,
+          amountPaid,
+          balanceDue: roundMoney(totalAmount - amountPaid),
+          items: { create: orderItems },
+        },
+        include: { items: true },
       });
+
+      if (status === 'received') {
+        for (const item of orderItems) {
+          const product = await tx.product.findUnique({ where: { id: item.productId } });
+          if (!product) {
+            throw new NotFoundException('Produit introuvable.');
+          }
+          await tx.product.update({
+            where: { id: item.productId },
+            data: {
+              stockQuantity: roundMoney(product.stockQuantity + item.quantity),
+              defaultPurchasePrice: this.weightedAverageCost(product.stockQuantity, product.defaultPurchasePrice, item.quantity, item.unitCost),
+            },
+          });
+        }
+
+        await tx.stockMovement.createMany({
+          data: orderItems.map((item) => ({
+            productId: item.productId,
+            productName: item.productName,
+            type: 'purchase',
+            quantityChange: item.quantity,
+            unitCost: item.unitCost,
+            reference: `Commande fournisseur ${created.id}`,
+            date: created.date,
+          })),
+        });
+      }
+
+      return created;
     });
+
+    return this.mapSupplierOrder(order);
+  }
+
+  async getSummary() {
+    return this.buildSummary(await this.readDatabase());
+  }
+
+  private async readDatabase(): Promise<Database> {
+    const [products, customers, suppliers, sales, supplierOrders, payments, stockMovements] = await Promise.all([
+      this.prisma.product.findMany({ orderBy: { name: 'asc' } }),
+      this.prisma.customer.findMany({ orderBy: { name: 'asc' } }),
+      this.prisma.supplier.findMany({ orderBy: { name: 'asc' } }),
+      this.prisma.sale.findMany({ include: { items: true }, orderBy: [{ date: 'desc' }, { createdAt: 'desc' }] }),
+      this.prisma.supplierOrder.findMany({ include: { items: true }, orderBy: [{ date: 'desc' }, { createdAt: 'desc' }] }),
+      this.prisma.payment.findMany({ orderBy: [{ date: 'desc' }, { createdAt: 'desc' }] }),
+      this.prisma.stockMovement.findMany({ orderBy: [{ date: 'desc' }, { createdAt: 'desc' }] }),
+    ]);
+
+    return {
+      products: products.map((product) => this.mapProduct(product)),
+      customers: customers.map((customer) => this.mapCustomer(customer)),
+      suppliers: suppliers.map((supplier) => this.mapSupplier(supplier)),
+      sales: sales.map((sale) => this.mapSale(sale)),
+      supplierOrders: supplierOrders.map((order) => this.mapSupplierOrder(order)),
+      payments: payments.map((payment) => ({
+        id: payment.id,
+        saleId: payment.saleId,
+        customerId: payment.customerId,
+        customerName: payment.customerName,
+        date: toDayString(payment.date),
+        amount: payment.amount,
+        note: payment.note,
+        createdAt: toIso(payment.createdAt),
+      })),
+      stockMovements: stockMovements.map((movement) => this.mapStockMovement(movement)),
+    };
   }
 
   private buildSummary(database: Database) {
@@ -438,50 +549,137 @@ export class BusinessService {
     return roundMoney(Math.min(subtotal, value));
   }
 
-  private stockMovement(product: Product, type: StockMovement['type'], quantityChange: number, unitCost: number, reference: string): StockMovement {
+  private stockMovementData(
+    product: Pick<Product, 'id' | 'name'>,
+    type: StockMovement['type'],
+    quantityChange: number,
+    unitCost: number,
+    reference: string,
+  ) {
     return {
-      id: id('move'),
       productId: product.id,
       productName: product.name,
       type,
       quantityChange,
       unitCost,
       reference,
-      date: today(),
-      createdAt: stamp(),
+      date: toDateInput(),
     };
   }
 
-  private findProduct(database: Database, productId: string) {
-    const product = database.products.find((item) => item.id === productId);
-    if (!product) {
-      throw new NotFoundException('Produit introuvable.');
-    }
-    return product;
+  private mapProduct(product: any): Product {
+    return {
+      id: product.id,
+      name: product.name,
+      sku: product.sku,
+      category: product.category,
+      unit: product.unit,
+      stockQuantity: product.stockQuantity,
+      lowStockThreshold: product.lowStockThreshold,
+      defaultPurchasePrice: product.defaultPurchasePrice,
+      defaultSalePrice: product.defaultSalePrice,
+      createdAt: toIso(product.createdAt),
+      updatedAt: toIso(product.updatedAt),
+    };
   }
 
-  private findCustomer(database: Database, customerId: string) {
-    const customer = database.customers.find((item) => item.id === customerId);
-    if (!customer) {
-      throw new NotFoundException('Client introuvable.');
-    }
-    return customer;
+  private mapCustomer(customer: any): Customer {
+    return {
+      id: customer.id,
+      name: customer.name,
+      phone: customer.phone,
+      email: customer.email,
+      createdAt: toIso(customer.createdAt),
+    };
   }
 
-  private findSupplier(database: Database, supplierId: string) {
-    const supplier = database.suppliers.find((item) => item.id === supplierId);
-    if (!supplier) {
-      throw new NotFoundException('Fournisseur introuvable.');
-    }
-    return supplier;
+  private mapSupplier(supplier: any): Supplier {
+    return {
+      id: supplier.id,
+      name: supplier.name,
+      phone: supplier.phone,
+      email: supplier.email,
+      createdAt: toIso(supplier.createdAt),
+    };
   }
 
-  private findSale(database: Database, saleId: string) {
-    const sale = database.sales.find((item) => item.id === saleId);
-    if (!sale) {
-      throw new NotFoundException('Vente introuvable.');
+  private mapSale(sale: any): Sale {
+    return {
+      id: sale.id,
+      customerId: sale.customerId,
+      customerName: sale.customerName,
+      date: toDayString(sale.date),
+      items: (sale.items || []).map((item: any) => ({
+        id: item.id,
+        productId: item.productId,
+        productName: item.productName,
+        quantity: item.quantity,
+        unitPrice: item.unitPrice,
+        discountType: item.discountType,
+        discountValue: item.discountValue,
+        unitCostSnapshot: item.unitCostSnapshot,
+        lineSubtotal: item.lineSubtotal,
+        discountAmount: item.discountAmount,
+        lineTotal: item.lineTotal,
+        lineCost: item.lineCost,
+        lineProfit: item.lineProfit,
+      })),
+      subtotal: sale.subtotal,
+      discountTotal: sale.discountTotal,
+      totalAmount: sale.totalAmount,
+      costTotal: sale.costTotal,
+      amountReceived: sale.amountReceived,
+      balanceDue: sale.balanceDue,
+      profit: sale.profit,
+      createdAt: toIso(sale.createdAt),
+      updatedAt: toIso(sale.updatedAt),
+    };
+  }
+
+  private mapSupplierOrder(order: any): SupplierOrder {
+    return {
+      id: order.id,
+      supplierId: order.supplierId,
+      supplierName: order.supplierName,
+      date: toDayString(order.date),
+      status: order.status,
+      items: (order.items || []).map((item: any) => ({
+        id: item.id,
+        productId: item.productId,
+        productName: item.productName,
+        quantity: item.quantity,
+        unitCost: item.unitCost,
+        lineTotal: item.lineTotal,
+      })),
+      deliveryFee: order.deliveryFee || 0,
+      totalAmount: order.totalAmount,
+      amountPaid: order.amountPaid,
+      balanceDue: order.balanceDue,
+      createdAt: toIso(order.createdAt),
+      updatedAt: toIso(order.updatedAt),
+    };
+  }
+
+  private mapStockMovement(movement: any): StockMovement {
+    return {
+      id: movement.id,
+      productId: movement.productId,
+      productName: movement.productName,
+      type: movement.type,
+      quantityChange: movement.quantityChange,
+      unitCost: movement.unitCost,
+      reference: movement.reference,
+      date: toDayString(movement.date),
+      createdAt: toIso(movement.createdAt),
+    };
+  }
+
+  private weightedAverageCost(currentQuantity: number, currentUnitCost: number, addedQuantity: number, addedUnitCost: number) {
+    const nextQuantity = currentQuantity + addedQuantity;
+    if (nextQuantity <= 0) {
+      return roundMoney(addedUnitCost);
     }
-    return sale;
+    return roundMoney((currentQuantity * currentUnitCost + addedQuantity * addedUnitCost) / nextQuantity);
   }
 
   private requireText(value: unknown, message: string) {

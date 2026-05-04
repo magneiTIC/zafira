@@ -1,5 +1,10 @@
+import { config } from 'dotenv';
+import { join } from 'path';
 import { NestFactory } from '@nestjs/core';
 import { AppModule } from './app.module';
+
+config({ path: join(process.cwd(), '.env') });
+config({ path: join(process.cwd(), 'apps', 'api', '.env') });
 
 async function bootstrap() {
   const app = await NestFactory.create(AppModule);

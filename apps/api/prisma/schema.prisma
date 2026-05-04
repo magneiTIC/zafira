@@ -1,0 +1,186 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum UserRole {
+  admin
+  staff
+}
+
+enum OrderStatus {
+  pending
+  received
+}
+
+enum DiscountType {
+  amount
+  percent
+}
+
+enum StockMovementType {
+  purchase
+  sale
+  adjustment
+}
+
+model User {
+  id           String   @id @default(cuid())
+  name         String
+  email        String   @unique
+  passwordHash String
+  role         UserRole @default(staff)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+}
+
+model Product {
+  id                   String              @id @default(cuid())
+  name                 String
+  sku                  String              @default("")
+  category             String              @default("General")
+  unit                 String              @default("piece")
+  stockQuantity        Float               @default(0)
+  lowStockThreshold    Float               @default(2)
+  defaultPurchasePrice Float               @default(0)
+  defaultSalePrice     Float               @default(0)
+  createdAt            DateTime            @default(now())
+  updatedAt            DateTime            @updatedAt
+  saleItems            SaleItem[]
+  supplierOrderItems   SupplierOrderItem[]
+  stockMovements       StockMovement[]
+}
+
+model Customer {
+  id        String    @id @default(cuid())
+  name      String
+  phone     String    @default("")
+  email     String    @default("")
+  createdAt DateTime  @default(now())
+  sales     Sale[]
+  payments  Payment[]
+}
+
+model Supplier {
+  id        String          @id @default(cuid())
+  name      String
+  phone     String          @default("")
+  email     String          @default("")
+  createdAt DateTime        @default(now())
+  orders    SupplierOrder[]
+}
+
+model Sale {
+  id             String     @id @default(cuid())
+  customerId     String
+  customerName   String
+  date           DateTime
+  subtotal       Float
+  discountTotal  Float
+  totalAmount    Float
+  costTotal      Float
+  amountReceived Float
+  balanceDue     Float
+  profit         Float
+  createdAt      DateTime   @default(now())
+  updatedAt      DateTime   @updatedAt
+  customer       Customer   @relation(fields: [customerId], references: [id])
+  items          SaleItem[]
+  payments       Payment[]
+
+  @@index([customerId])
+  @@index([date])
+}
+
+model SaleItem {
+  id               String       @id @default(cuid())
+  saleId           String
+  productId        String
+  productName      String
+  quantity         Float
+  unitPrice        Float
+  discountType     DiscountType @default(amount)
+  discountValue    Float        @default(0)
+  unitCostSnapshot Float
+  lineSubtotal     Float
+  discountAmount   Float
+  lineTotal        Float
+  lineCost         Float
+  lineProfit       Float
+  sale             Sale         @relation(fields: [saleId], references: [id], onDelete: Cascade)
+  product          Product      @relation(fields: [productId], references: [id])
+
+  @@index([saleId])
+  @@index([productId])
+}
+
+model SupplierOrder {
+  id           String              @id @default(cuid())
+  supplierId   String
+  supplierName String
+  date         DateTime
+  status       OrderStatus         @default(received)
+  deliveryFee  Float               @default(0)
+  totalAmount  Float
+  amountPaid   Float
+  balanceDue   Float
+  createdAt    DateTime            @default(now())
+  updatedAt    DateTime            @updatedAt
+  supplier     Supplier            @relation(fields: [supplierId], references: [id])
+  items        SupplierOrderItem[]
+
+  @@index([supplierId])
+  @@index([date])
+}
+
+model SupplierOrderItem {
+  id              String        @id @default(cuid())
+  supplierOrderId String
+  productId       String
+  productName     String
+  quantity        Float
+  unitCost        Float
+  lineTotal       Float
+  supplierOrder   SupplierOrder @relation(fields: [supplierOrderId], references: [id], onDelete: Cascade)
+  product         Product       @relation(fields: [productId], references: [id])
+
+  @@index([supplierOrderId])
+  @@index([productId])
+}
+
+model Payment {
+  id           String   @id @default(cuid())
+  saleId       String
+  customerId   String
+  customerName String
+  date         DateTime
+  amount       Float
+  note         String   @default("")
+  createdAt    DateTime @default(now())
+  sale         Sale     @relation(fields: [saleId], references: [id], onDelete: Cascade)
+  customer     Customer @relation(fields: [customerId], references: [id])
+
+  @@index([saleId])
+  @@index([customerId])
+  @@index([date])
+}
+
+model StockMovement {
+  id             String            @id @default(cuid())
+  productId      String
+  productName    String
+  type           StockMovementType
+  quantityChange Float
+  unitCost       Float
+  reference      String
+  date           DateTime
+  createdAt      DateTime          @default(now())
+  product        Product           @relation(fields: [productId], references: [id])
+
+  @@index([productId])
+  @@index([date])
+}
